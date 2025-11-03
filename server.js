@@ -14,6 +14,10 @@ const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const ENABLE_ESPN = process.env.ENABLE_ESPN === '1';
 const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,'');
 const ESPN_DEBUG = process.env.ESPN_DEBUG === '1';
+const ADSENSE_ACCOUNT = process.env.ADSENSE_ACCOUNT || 'ca-pub-4391382697370741';
+const ADSENSE_SLOT_TOP = process.env.ADSENSE_SLOT_TOP || '';
+const ADSENSE_SLOT_MID = process.env.ADSENSE_SLOT_MID || '';
+const ADSENSE_SLOT_FOOT = process.env.ADSENSE_SLOT_FOOT || '';
 const PREDICT_USING_FORM = process.env.PREDICT_USING_FORM === '1';
 const ESPN_LOOSE = process.env.ESPN_LOOSE === '1';
 
@@ -280,8 +284,8 @@ cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ })
 // ---- UI
 const HEAD = `
   <meta charset="utf-8" />
-  <meta name="google-adsense-account" content="ca-pub-4391382697370741">
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4391382697370741" crossorigin="anonymous"></script>
+  <meta name="google-adsense-account" content="${ADSENSE_ACCOUNT}">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_ACCOUNT}" crossorigin="anonymous"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BetEstimate.com — Today’s AI Football Picks</title>
   <script src="https://cdn.tailwindcss.com"></script>
@@ -303,6 +307,12 @@ function headerBar(){
 }
 const FOOT = `<footer class="mt-6 text-xs text-slate-300/90 italic">Use the data at your own risk. Informational only — no guarantees.</footer>`;
 
+
+app.get('/ads.txt', (_req, res)=>{
+  const txt = (process.env.ADS_TXT || `google.com, ${ADSENSE_ACCOUNT.replace('ca-pub-','')}, DIRECT, f08c47fec0942fa0`).trim() + "\n";
+  res.setHeader('Content-Type','text/plain; charset=utf-8');
+  res.send(txt);
+});
 app.get('/api/today', async (_req, res)=>{
   const now = todayYMD();
   if (CACHE.date !== now) await warmCache();
@@ -320,8 +330,8 @@ app.get('/diag-espn', async (_req, res)=>{
 app.get('/', (_req, res)=>{
   const html = `<!doctype html><html lang="en"><head>${HEAD}</head><body>
   <div class="max-w-6xl mx-auto p-4 space-y-4">
-    ${headerBar()}
-    <div class="overflow-x-auto bg-slate-900/40 border border-slate-800 rounded-xl shadow">
+    ${headerBar()}\n    <div class="my-3">\n      <ins class="adsbygoogle" style="display:block" data-ad-client="${ADSENSE_ACCOUNT}" data-ad-slot="${ADSENSE_SLOT_TOP}" data-ad-format="auto" data-full-width-responsive="true"></ins>\n      <script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>\n    </div>
+    <div class="my-3">  <ins class="adsbygoogle" style="display:block" data-ad-client="${ADSENSE_ACCOUNT}" data-ad-slot="${ADSENSE_SLOT_MID}" data-ad-format="auto" data-full-width-responsive="true"></ins>  <script>(adsbygoogle=window.adsbygoogle||[]).push({});</script></div><div class="overflow-x-auto bg-slate-900/40 border border-slate-800 rounded-xl shadow">
       <table class="min-w-full text-[13px]" id="tbl">
         <thead class="bg-slate-800 sticky">
           <tr>
