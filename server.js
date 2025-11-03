@@ -14,6 +14,7 @@ const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const ENABLE_ESPN = process.env.ENABLE_ESPN === '1';
 const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,'');
 const ESPN_DEBUG = process.env.ESPN_DEBUG === '1';
+const PREDICT_USING_FORM = process.env.PREDICT_USING_FORM === '1';
 const ESPN_LOOSE = process.env.ESPN_LOOSE === '1';
 
 const START_HOUR = parseInt(process.env.START_HOUR || '0', 10);
@@ -107,19 +108,31 @@ async function sourceFootballDataToday(){
     const { hh } = localParts(kickoffIso);
     if (!(hh >= START_HOUR && hh < END_HOUR)) continue;
     const home = f.homeTeam?.name || ''; const away = f.awayTeam?.name || '';
+    const homeId = f.homeTeam?.id; const awayId = f.awayTeam?.id;
     const { lh, la } = expectedGoalsAdvanced(home, away, league);
     const ch = choiceFrom(lh, la);
     let primary='', alt=''; let primaryEdgePct=0, altEdgePct=0;
+    // Optional: last-5 form (same competition) if team IDs are available
+    let homeForm = {pts:0,gf:0,ga:0,matches:0}, awayForm = {pts:0,gf:0,ga:0,matches:0}, formPick = null, formEdgePct = 0;
+    try{
+      if (homeId && awayId && f.competition?.id){
+        homeForm = await teamFormLast5(homeId, f.competition.id, kickoffIso);
+        awayForm = await teamFormLast5(awayId, f.competition.id, kickoffIso);
+        const fl = formLean(homeForm, awayForm);
+        formPick = fl.pick; formEdgePct = fl.edge;
+      }
+    }catch(_e){ /* ignore form errors */ }
+
     if (ch?.top){ primary = `${ch.top.market}: ${ch.top.label} (${Math.round(ch.top.prob*100)}%)`; primaryEdgePct = Math.round(Math.max(0,ch.top.edge)*100); }
     if (ch?.second){ alt = `${ch.second.market}: ${ch.second.label} (${Math.round(ch.second.prob*100)}%)`; altEdgePct = Math.round(Math.max(0,ch.second.edge)*100); }
-    rows.push({ league, kickoffIso, kickoff: toLocalLabel(kickoffIso), home, away, prediction: primary, altPrediction: alt, primaryEdgePct, altEdgePct, source:'FD' });
+    rows.push({  league, kickoffIso, kickoff: toLocalLabel(kickoffIso), home, away, prediction: primary, altPrediction: alt, primaryEdgePct, altEdgePct, source:'FD' , homeFormPts: homeForm.pts, awayFormPts: awayForm.pts, homeFormGF: homeForm.gf, homeFormGA: homeForm.ga, awayFormGF: awayForm.gf, awayFormGA: awayForm.ga, formPick, formEdgePct });
   }
   rows.sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
   return { rows, meta:{ name:'fd', used:true, count: rows.length, url, status, bodyHead: String(txt).slice(0,300) } };
 }
 
 // ---- ESPN parsing helpers
-function headerMap($table){
+function headerMap($, $table){
   const heads = [];
   $table.find('thead th').each((i,th)=> heads.push($(th).text().trim().toUpperCase()));
   const idx = { match: -1, time: -1 };
@@ -186,7 +199,7 @@ async function sourceEspnScheduleToday(tz = TZ){
 
   tables.each((_, tbl)=>{
     const $tbl = $(tbl);
-    const idx = headerMap($tbl);
+    const idx = headerMap($, $tbl);
     if (idx.match === -1 || idx.time === -1) return; // not a MATCH/TIME table
 
     const leagueRaw = nearestLeague($, $tbl) || '';
@@ -337,7 +350,7 @@ app.get('/', (_req, res)=>{
           "<td class='px-2 py-2 font-semibold'>"+(x.home||'')+"</td>" +
           "<td class='px-2 py-2'>"+(x.away||'')+"</td>" +
           "<td class='px-2 py-2'>"+(x.prediction||'')+"</td>" +
-          "<td class='px-2 py-2 opacity-80'>"+(x.altPrediction||'')+"</td>" +
+          "<td class='px-2 py-2 opacity-80'>"+((x.altPrediction||'')+(x.formPick? (' | Form:'+x.formPick+'('+x.formEdgePct+'%)') : ''))+"</td>" +
         "</tr>";
       }).join('');
     }
@@ -355,3 +368,49 @@ app.listen(PORT, HOST, ()=>{
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   setTimeout(()=>{ warmCache().catch(e=>console.error('[warmCache] error', e)); }, 1200);
 });
+
+// ---- Team recent form (last 5 league matches) using football-data.org
+const FORM_CACHE = new Map(); // key: `${teamId}_${compId}_${dateTo}` -> { pts, gf, ga, matches }
+async function teamFormLast5(teamId, compId, dateToIso){
+  if (!API_KEY || !teamId) return { pts:0, gf:0, ga:0, matches:0 };
+  const dateTo = (dateToIso||new Date().toISOString()).slice(0,10);
+  const key = `${teamId}_${compId||'any'}_${dateTo}`;
+  if (FORM_CACHE.has(key)) return FORM_CACHE.get(key);
+
+  const dateFrom = addDaysLocalYMD(-120, TZ); // search window
+  const url = `https://api.football-data.org/v4/teams/${teamId}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=FINISHED`;
+  const { status, json } = await getJson(url);
+  const all = Array.isArray(json?.matches) ? json.matches : [];
+  const filtered = (compId ? all.filter(m => (m.competition?.id === compId)) : all);
+  const done = filtered.filter(m => m.score?.fullTime && (m.homeTeam?.id===teamId || m.awayTeam?.id===teamId));
+  done.sort((a,b)=> String(b.utcDate).localeCompare(String(a.utcDate)));
+  const last5 = done.slice(0,5);
+  let pts=0,gf=0,ga=0,played=0;
+  for (const m of last5){
+    const hId = m.homeTeam?.id, aId = m.awayTeam?.id;
+    const hs = Number(m.score?.fullTime?.home ?? 0);
+    const as = Number(m.score?.fullTime?.away ?? 0);
+    if (!(hId && aId)) continue;
+    played++;
+    const isHome = (hId === teamId);
+    const forGoals = isHome ? hs : as;
+    const agGoals = isHome ? as : hs;
+    gf += forGoals; ga += agGoals;
+    if (hs===as) pts += 1;
+    else if ((hs>as && isHome) || (as>hs && !isHome)) pts += 3;
+  }
+  const out = { pts, gf, ga, matches: played };
+  FORM_CACHE.set(key, out);
+  return out;
+}
+
+function formLean(hForm, aForm){
+  // Simple heuristic: compare points over last 5; break ties with goal difference
+  const hp = hForm.pts, ap = aForm.pts;
+  if (hp - ap >= 3) return { pick: 'HOME', edge: Math.round((hp-ap)/15*100) };
+  if (ap - hp >= 3) return { pick: 'AWAY', edge: Math.round((ap-hp)/15*100) };
+  const hgd = (hForm.gf - hForm.ga), agd = (aForm.gf - aForm.ga);
+  if (hgd - agd > 2) return { pick: 'HOME', edge: 10 };
+  if (agd - hgd > 2) return { pick: 'AWAY', edge: 10 };
+  return { pick: 'DRAW', edge: 0 };
+}
