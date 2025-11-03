@@ -1,6 +1,6 @@
 {
-  "name": "betestimate-aipicks-v5-5-3",
-  "version": "5.5.3",
+  "name": "betestimate-aipicks-v5-5-4",
+  "version": "5.5.4",
   "type": "module",
   "main": "server.js",
   "engines": {
