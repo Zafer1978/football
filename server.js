@@ -14,10 +14,6 @@ const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const ENABLE_ESPN = process.env.ENABLE_ESPN === '1';
 const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,'');
 const ESPN_DEBUG = process.env.ESPN_DEBUG === '1';
-const ADSENSE_ACCOUNT = process.env.ADSENSE_ACCOUNT || 'ca-pub-4391382697370741';
-const ADSENSE_SLOT_TOP = process.env.ADSENSE_SLOT_TOP || '';
-const ADSENSE_SLOT_MID = process.env.ADSENSE_SLOT_MID || '';
-const ADSENSE_SLOT_FOOT = process.env.ADSENSE_SLOT_FOOT || '';
 const ESPN_LOOSE = process.env.ESPN_LOOSE === '1';
 
 const START_HOUR = parseInt(process.env.START_HOUR || '0', 10);
@@ -123,7 +119,7 @@ async function sourceFootballDataToday(){
 }
 
 // ---- ESPN parsing helpers
-function headerMap($, $table){
+function headerMap($table){
   const heads = [];
   $table.find('thead th').each((i,th)=> heads.push($(th).text().trim().toUpperCase()));
   const idx = { match: -1, time: -1 };
@@ -190,7 +186,7 @@ async function sourceEspnScheduleToday(tz = TZ){
 
   tables.each((_, tbl)=>{
     const $tbl = $(tbl);
-    const idx = headerMap($, $tbl);
+    const idx = headerMap($tbl);
     if (idx.match === -1 || idx.time === -1) return; // not a MATCH/TIME table
 
     const leagueRaw = nearestLeague($, $tbl) || '';
@@ -271,17 +267,12 @@ cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ })
 // ---- UI
 const HEAD = `
   <meta charset="utf-8" />
-  <meta name="google-adsense-account" content="${ADSENSE_ACCOUNT}">
-  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=${ADSENSE_ACCOUNT}" crossorigin="anonymous"></script>
+  <meta name="google-adsense-account" content="ca-pub-4391382697370741">
+  <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4391382697370741" crossorigin="anonymous"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>BetEstimate.com — Today’s AI Football Picks</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    
-    .ad-wrap{background:transparent; border:1px dashed rgba(148,163,184,.25); border-radius:.75rem; padding:.25rem;}
-    .seo-intro{background:rgba(15,23,42,.5); border:1px solid #1f2937; border-radius:.75rem; padding:10px; font-size:14px;}
-    .seo-intro b{color:#93c5fd}
-  
     :root{ --bg:#0b1220; --card:#0f172a; --accent:#22d3ee; --accent2:#f59e0b; --good:#bbf7d0; --med:#fde68a; --low:#e5e7eb; --muted:#f3f4f6; }
     body{background:var(--bg); color:#e5e7eb;} a{color:#93c5fd}
     thead.sticky th{position:sticky;top:0;z-index:10}
@@ -293,18 +284,24 @@ const HEAD = `
 `;
 function headerBar(){
   return `<header class="rounded-xl bg-slate-800/60 border border-slate-700 p-4">
-    <div class="flex items-center justify-between gap-4 flex-wrap">
-      <div>
-        <h1 class="text-3xl md:text-4xl font-extrabold leading-tight">
+    <div class="flex items-center justify-between flex-wrap gap-2">
+      <div class="flex flex-col">
+        <h1 class="text-4xl md:text-5xl font-extrabold leading-tight tracking-tight">
           BetEstimate<span class="text-cyan-300">.com</span>
         </h1>
-        <p class="mt-1 text-sm md:text-base text-slate-300">
+        <p class="mt-1 text-sm md:text-base text-slate-300 max-w-2xl">
           <strong>AI statistical football predictions</strong> for today — 1X2, Over/Under 2.5, BTTS —
-          powered by probability models and last‑5 form across Premier League, La Liga, Serie A, Bundesliga, Süper Lig and more.
+          powered by probability models and last-5 form across Premier League, La Liga, Serie A, Bundesliga, Süper Lig and more.
         </p>
       </div>
-      <nav class="space-x-3 text-sm"><a href="/">Home</a><a href="/about">About</a><a href="/privacy">Privacy</a><a href="/contact">Contact</a></nav>
-    </div>`;
+      <nav class="flex items-center space-x-4 text-sm md:text-base text-slate-200">
+        <a href="/" class="hover:text-cyan-300">Home</a>
+        <a href="/about" class="hover:text-cyan-300">About</a>
+        <a href="/privacy" class="hover:text-cyan-300">Privacy</a>
+        <a href="/contact" class="hover:text-cyan-300">Contact</a>
+      </nav>
+    </div>
+  </header>`;
 }
 const FOOT = `<footer class="mt-6 text-xs text-slate-300/90 italic">Use the data at your own risk. Informational only — no guarantees.</footer>`;
 
@@ -365,27 +362,8 @@ app.get('/', (_req, res)=>{
   res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(html);
 });
 
-app.get('/about', (_req, res)=>{
-  const body = `<!doctype html><head>${HEAD}</head><body>
-  <div class="max-w-3xl mx-auto p-4">${headerBar()}
-  <main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm space-y-3">
-    <p><strong>About BetEstimate</strong></p>
-    <p>BetEstimate provides <em>AI statistical football predictions</em> based on probability models, expected goals and recent form indicators. Results are informational only and <strong>use at your own risk</strong>.</p>
-    <p>We are committed to Google AdSense policies worldwide and maintain a brand-safe experience for all users.</p>
-    <p>Leagues covered include Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Süper Lig and more. Markets include 1X2, Over/Under 2.5 and BTTS.</p>
-  </main>${FOOT}</div></body>`;
-  res.send(body);
-});
-app.get('/privacy', (_req, res)=>{
-  const body = `<!doctype html><head>${HEAD}</head><body>
-  <div class="max-w-3xl mx-auto p-4">${headerBar()}
-  <main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm space-y-3">
-    <p><strong>Privacy</strong></p>
-    <p>We respect your privacy and comply with Google AdSense policies globally. We may use standard analytics and AdSense cookies to deliver and measure ads in accordance with their policies.</p>
-    <p>No guarantees are provided on accuracy; predictions are for entertainment and information only. <strong>Use the data at your own risk</strong>.</p>
-  </main>${FOOT}</div></body>`;
-  res.send(body);
-});
+app.get('/about', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">BetEstimate uses AI models to estimate 1X2 / O-U 2.5 / BTTS. Use at your own risk.</main>'+FOOT+'</div></body>'));
+app.get('/privacy', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">Basic analytics and AdSense may set cookies per their policies.</main>'+FOOT+'</div></body>'));
 app.get('/contact', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">contact@betestimate.com</main>'+FOOT+'</div></body>'));
 
 app.listen(PORT, HOST, ()=>{
