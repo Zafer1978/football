@@ -18,7 +18,6 @@ const ADSENSE_ACCOUNT = process.env.ADSENSE_ACCOUNT || 'ca-pub-4391382697370741'
 const ADSENSE_SLOT_TOP = process.env.ADSENSE_SLOT_TOP || '';
 const ADSENSE_SLOT_MID = process.env.ADSENSE_SLOT_MID || '';
 const ADSENSE_SLOT_FOOT = process.env.ADSENSE_SLOT_FOOT || '';
-const PREDICT_USING_FORM = process.env.PREDICT_USING_FORM === '1';
 const ESPN_LOOSE = process.env.ESPN_LOOSE === '1';
 
 const START_HOUR = parseInt(process.env.START_HOUR || '0', 10);
@@ -112,31 +111,19 @@ async function sourceFootballDataToday(){
     const { hh } = localParts(kickoffIso);
     if (!(hh >= START_HOUR && hh < END_HOUR)) continue;
     const home = f.homeTeam?.name || ''; const away = f.awayTeam?.name || '';
-    const homeId = f.homeTeam?.id; const awayId = f.awayTeam?.id;
     const { lh, la } = expectedGoalsAdvanced(home, away, league);
     const ch = choiceFrom(lh, la);
     let primary='', alt=''; let primaryEdgePct=0, altEdgePct=0;
-    // Optional: last-5 form (same competition) if team IDs are available
-    let homeForm = {pts:0,gf:0,ga:0,matches:0}, awayForm = {pts:0,gf:0,ga:0,matches:0}, formPick = null, formEdgePct = 0;
-    try{
-      if (homeId && awayId && f.competition?.id){
-        homeForm = await teamFormLast5(homeId, f.competition.id, kickoffIso);
-        awayForm = await teamFormLast5(awayId, f.competition.id, kickoffIso);
-        const fl = formLean(homeForm, awayForm);
-        formPick = fl.pick; formEdgePct = fl.edge;
-      }
-    }catch(_e){ /* ignore form errors */ }
-
     if (ch?.top){ primary = `${ch.top.market}: ${ch.top.label} (${Math.round(ch.top.prob*100)}%)`; primaryEdgePct = Math.round(Math.max(0,ch.top.edge)*100); }
     if (ch?.second){ alt = `${ch.second.market}: ${ch.second.label} (${Math.round(ch.second.prob*100)}%)`; altEdgePct = Math.round(Math.max(0,ch.second.edge)*100); }
-    rows.push({  league, kickoffIso, kickoff: toLocalLabel(kickoffIso), home, away, prediction: primary, altPrediction: alt, primaryEdgePct, altEdgePct, source:'FD' , homeFormPts: homeForm.pts, awayFormPts: awayForm.pts, homeFormGF: homeForm.gf, homeFormGA: homeForm.ga, awayFormGF: awayForm.gf, awayFormGA: awayForm.ga, formPick, formEdgePct });
+    rows.push({ league, kickoffIso, kickoff: toLocalLabel(kickoffIso), home, away, prediction: primary, altPrediction: alt, primaryEdgePct, altEdgePct, source:'FD' });
   }
   rows.sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
   return { rows, meta:{ name:'fd', used:true, count: rows.length, url, status, bodyHead: String(txt).slice(0,300) } };
 }
 
 // ---- ESPN parsing helpers
-function headerMap($, $table){
+function headerMap($table){
   const heads = [];
   $table.find('thead th').each((i,th)=> heads.push($(th).text().trim().toUpperCase()));
   const idx = { match: -1, time: -1 };
@@ -203,7 +190,7 @@ async function sourceEspnScheduleToday(tz = TZ){
 
   tables.each((_, tbl)=>{
     const $tbl = $(tbl);
-    const idx = headerMap($, $tbl);
+    const idx = headerMap($tbl);
     if (idx.match === -1 || idx.time === -1) return; // not a MATCH/TIME table
 
     const leagueRaw = nearestLeague($, $tbl) || '';
@@ -290,6 +277,11 @@ const HEAD = `
   <title>BetEstimate.com — Today’s AI Football Picks</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
+    .ad-box{min-height:250px; display:block; width:100%;}
+    .ad-wrap{background:transparent; border:1px dashed rgba(148,163,184,.25); border-radius:.75rem; padding:.25rem;}
+    .seo-intro{background:rgba(15,23,42,.5); border:1px solid #1f2937; border-radius:.75rem; padding:10px; font-size:14px;}
+    .seo-intro b{color:#93c5fd}
+  
     :root{ --bg:#0b1220; --card:#0f172a; --accent:#22d3ee; --accent2:#f59e0b; --good:#bbf7d0; --med:#fde68a; --low:#e5e7eb; --muted:#f3f4f6; }
     body{background:var(--bg); color:#e5e7eb;} a{color:#93c5fd}
     thead.sticky th{position:sticky;top:0;z-index:10}
@@ -307,12 +299,6 @@ function headerBar(){
 }
 const FOOT = `<footer class="mt-6 text-xs text-slate-300/90 italic">Use the data at your own risk. Informational only — no guarantees.</footer>`;
 
-
-app.get('/ads.txt', (_req, res)=>{
-  const txt = (process.env.ADS_TXT || `google.com, ${ADSENSE_ACCOUNT.replace('ca-pub-','')}, DIRECT, f08c47fec0942fa0`).trim() + "\n";
-  res.setHeader('Content-Type','text/plain; charset=utf-8');
-  res.send(txt);
-});
 app.get('/api/today', async (_req, res)=>{
   const now = todayYMD();
   if (CACHE.date !== now) await warmCache();
@@ -330,8 +316,8 @@ app.get('/diag-espn', async (_req, res)=>{
 app.get('/', (_req, res)=>{
   const html = `<!doctype html><html lang="en"><head>${HEAD}</head><body>
   <div class="max-w-6xl mx-auto p-4 space-y-4">
-    ${headerBar()}\n    <div class="my-3">\n      <ins class="adsbygoogle" style="display:block" data-ad-client="${ADSENSE_ACCOUNT}" data-ad-slot="${ADSENSE_SLOT_TOP}" data-ad-format="auto" data-full-width-responsive="true"></ins>\n      <script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>\n    </div>
-    <div class="my-3">  <ins class="adsbygoogle" style="display:block" data-ad-client="${ADSENSE_ACCOUNT}" data-ad-slot="${ADSENSE_SLOT_MID}" data-ad-format="auto" data-full-width-responsive="true"></ins>  <script>(adsbygoogle=window.adsbygoogle||[]).push({});</script></div><div class="overflow-x-auto bg-slate-900/40 border border-slate-800 rounded-xl shadow">
+    ${headerBar()}
+    <div class="overflow-x-auto bg-slate-900/40 border border-slate-800 rounded-xl shadow">
       <table class="min-w-full text-[13px]" id="tbl">
         <thead class="bg-slate-800 sticky">
           <tr>
@@ -360,7 +346,7 @@ app.get('/', (_req, res)=>{
           "<td class='px-2 py-2 font-semibold'>"+(x.home||'')+"</td>" +
           "<td class='px-2 py-2'>"+(x.away||'')+"</td>" +
           "<td class='px-2 py-2'>"+(x.prediction||'')+"</td>" +
-          "<td class='px-2 py-2 opacity-80'>"+((x.altPrediction||'')+(x.formPick? (' | Form:'+x.formPick+'('+x.formEdgePct+'%)') : ''))+"</td>" +
+          "<td class='px-2 py-2 opacity-80'>"+(x.altPrediction||'')+"</td>" +
         "</tr>";
       }).join('');
     }
@@ -370,57 +356,11 @@ app.get('/', (_req, res)=>{
   res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(html);
 });
 
-app.get('/about', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">BetEstimate uses AI models to estimate 1X2 / O-U 2.5 / BTTS. Use at your own risk.</main>'+FOOT+'</div></body>'));
-app.get('/privacy', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">Basic analytics and AdSense may set cookies per their policies.</main>'+FOOT+'</div></body>'));
+app.get('/about', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm space-y-3">  <p><strong>About BetEstimate</strong></p>  <p>BetEstimate provides <em>AI statistical football predictions</em> based on probability models, expected goals and recent form indicators. Results are informational only and <strong>use at your own risk</strong>.</p>  <p>We are committed to Google AdSense policies worldwide and maintain a brand‑safe experience for all users.</p>  <p>Leagues covered include Premier League, La Liga, Serie A, Bundesliga, Ligue 1, Süper Lig and more. Markets include 1X2, Over/Under 2.5 and BTTS.</p>'+FOOT+'</div></body>'));
+app.get('/privacy', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm space-y-3">  <p><strong>Privacy</strong></p>  <p>We respect your privacy and comply with Google AdSense policies globally. We may use standard analytics and AdSense cookies to deliver and measure ads in accordance with their policies.</p>  <p>No guarantees are provided on accuracy; predictions are for entertainment and information only. <strong>Use the data at your own risk</strong>.</p>'+FOOT+'</div></body>'));
 app.get('/contact', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head><body><div class="max-w-3xl mx-auto p-4">'+headerBar()+'<main class="bg-slate-900/40 border border-slate-800 rounded-xl p-4 mt-4 text-sm">contact@betestimate.com</main>'+FOOT+'</div></body>'));
 
 app.listen(PORT, HOST, ()=>{
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   setTimeout(()=>{ warmCache().catch(e=>console.error('[warmCache] error', e)); }, 1200);
 });
-
-// ---- Team recent form (last 5 league matches) using football-data.org
-const FORM_CACHE = new Map(); // key: `${teamId}_${compId}_${dateTo}` -> { pts, gf, ga, matches }
-async function teamFormLast5(teamId, compId, dateToIso){
-  if (!API_KEY || !teamId) return { pts:0, gf:0, ga:0, matches:0 };
-  const dateTo = (dateToIso||new Date().toISOString()).slice(0,10);
-  const key = `${teamId}_${compId||'any'}_${dateTo}`;
-  if (FORM_CACHE.has(key)) return FORM_CACHE.get(key);
-
-  const dateFrom = addDaysLocalYMD(-120, TZ); // search window
-  const url = `https://api.football-data.org/v4/teams/${teamId}/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=FINISHED`;
-  const { status, json } = await getJson(url);
-  const all = Array.isArray(json?.matches) ? json.matches : [];
-  const filtered = (compId ? all.filter(m => (m.competition?.id === compId)) : all);
-  const done = filtered.filter(m => m.score?.fullTime && (m.homeTeam?.id===teamId || m.awayTeam?.id===teamId));
-  done.sort((a,b)=> String(b.utcDate).localeCompare(String(a.utcDate)));
-  const last5 = done.slice(0,5);
-  let pts=0,gf=0,ga=0,played=0;
-  for (const m of last5){
-    const hId = m.homeTeam?.id, aId = m.awayTeam?.id;
-    const hs = Number(m.score?.fullTime?.home ?? 0);
-    const as = Number(m.score?.fullTime?.away ?? 0);
-    if (!(hId && aId)) continue;
-    played++;
-    const isHome = (hId === teamId);
-    const forGoals = isHome ? hs : as;
-    const agGoals = isHome ? as : hs;
-    gf += forGoals; ga += agGoals;
-    if (hs===as) pts += 1;
-    else if ((hs>as && isHome) || (as>hs && !isHome)) pts += 3;
-  }
-  const out = { pts, gf, ga, matches: played };
-  FORM_CACHE.set(key, out);
-  return out;
-}
-
-function formLean(hForm, aForm){
-  // Simple heuristic: compare points over last 5; break ties with goal difference
-  const hp = hForm.pts, ap = aForm.pts;
-  if (hp - ap >= 3) return { pick: 'HOME', edge: Math.round((hp-ap)/15*100) };
-  if (ap - hp >= 3) return { pick: 'AWAY', edge: Math.round((ap-hp)/15*100) };
-  const hgd = (hForm.gf - hForm.ga), agd = (aForm.gf - aForm.ga);
-  if (hgd - agd > 2) return { pick: 'HOME', edge: 10 };
-  if (agd - hgd > 2) return { pick: 'AWAY', edge: 10 };
-  return { pick: 'DRAW', edge: 0 };
-}
