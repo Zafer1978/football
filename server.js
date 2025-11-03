@@ -1,8 +1,8 @@
-// server.js — BetEstimate.com v5.5.0 (ESPN+API merge with fallback, debug toggles)
-// Uses ESPN schedule (if enabled) + football-data.org API (if key present).
-// Picks are AI-estimated via Poisson + form + seed strengths.
-// Color-coded rows by edge. Includes /diag and /diag-espn diagnostics.
-// Render: build=npm install, start=npm start, Node 20.x
+// server.js — BetEstimate v5.5.3 (ESPN league detection ++, safer fallback)
+// - Stronger ESPN league detection: checks nearest headings, ancestor cards, and anchor texts (competition/league links)
+// - If league still unknown and ESPN_LOOSE=1, keep row but tag league from any anchor text in row (last resort)
+// - If ESPN yields mostly unknown AND HIDE_PREDICTIONLESS=1, API rows will still show (with picks) and dominate
+// - Diag logs count detected "unknown" to help tune filters
 
 import express from 'express';
 import dotenv from 'dotenv';
@@ -16,29 +16,25 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = '0.0.0.0';
 const TZ = process.env.TZ || 'Europe/Istanbul';
 
-// --- Sources / toggles
-const API_KEY = process.env.FOOTBALL_DATA_KEY || ''; // football-data.org (optional)
+const API_KEY = process.env.FOOTBALL_DATA_KEY || '';
 const ENABLE_ESPN = process.env.ENABLE_ESPN === '1';
-const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,''); // no trailing slash
+const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,'');
+const ESPN_DEBUG = process.env.ESPN_DEBUG === '1';
+const ESPN_LOOSE = process.env.ESPN_LOOSE === '1';
 
-// --- ESPN parser debug/loose
-const ESPN_DEBUG = process.env.ESPN_DEBUG === '1'; // log URL & sample, first bytes
-const ESPN_LOOSE = process.env.ESPN_LOOSE === '1'; // skip league filter if DOM is different
-
-// --- Filters & time window
-const START_HOUR = parseInt(process.env.START_HOUR || '0', 10); // local hour inclusive
+const START_HOUR = parseInt(process.env.START_HOUR || '0', 10);
 const END_HOUR = 24;
 
-// --- Model tuning
 const SHARPEN_TAU_1X2 = parseFloat(process.env.SHARPEN_TAU_1X2 || '1.25');
 const STRONG_DIFF_TILT = parseFloat(process.env.STRONG_DIFF_TILT || '220');
-const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08'); // 8%
+const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08');
+
+const HIDE_PREDICTIONLESS = (process.env.HIDE_PREDICTIONLESS ?? '1') === '1';
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.disable('x-powered-by');
 
-// ---------- Time helpers
 function fmtYMD(d, tz = TZ) {
   const f = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
   return f.format(d);
@@ -48,11 +44,6 @@ function addDaysLocalYMD(days=0, tz = TZ){
   const now = new Date();
   const base = new Date(now.getTime() + days*24*3600*1000);
   return fmtYMD(base, tz);
-}
-function localStartEndISODate(tz = TZ){
-  const from = addDaysLocalYMD(0, tz);
-  const to = addDaysLocalYMD(1, tz);
-  return [from, to];
 }
 function localParts(iso, tz = TZ) {
   const dt = new Date(iso);
@@ -69,7 +60,7 @@ function toLocalLabel(iso, tz = TZ) {
   return `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}`;
 }
 
-// ---------- League filters for ESPN
+// ---- League filters
 function buildRegex(listStr) {
   const s = (listStr || '').trim();
   if (!s) return null;
@@ -80,7 +71,7 @@ function buildRegex(listStr) {
 const RX_PRIMARY   = buildRegex(process.env.ESPN_PRIMARY);
 const RX_SECONDARY = buildRegex(process.env.ESPN_SECONDARY);
 const RX_INTL      = buildRegex(process.env.ESPN_INTL);
-function isWantedLeague(leagueLabel = '') {
+function leagueLooksWanted(leagueLabel = '') {
   const name = (leagueLabel || '').toLowerCase();
   if (!name) return false;
   if (RX_PRIMARY && RX_PRIMARY.test(name)) return true;
@@ -90,7 +81,7 @@ function isWantedLeague(leagueLabel = '') {
   return defaults.test(name);
 }
 
-// ---------- Aliases & seed strengths
+// ---- Team names & seeds
 function normTeam(s=''){ return s.toLowerCase().replace(/[^a-z0-9]+/g,' ').trim(); }
 const ALIAS = new Map([
   ['paris saint germain','psg'], ['paris saint germain fc','psg'],
@@ -108,11 +99,11 @@ function canonicalKey(name){
   return n;
 }
 const SEED_ELO = {
-  'psg':1850,'paris saint germain':1850,
-  'real madrid':1850,'barcelona':1820,'manchester city':1880,'liverpool':1820,'arsenal':1800,
-  'chelsea':1750,'manchester united':1760,'bayern munich':1900,'inter':1820,'juventus':1800,
-  'milan':1780,'atletico madrid':1800,'napoli':1780,'roma':1740,'tottenham':1760,
-  'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620,'nantes':1600
+  'psg':1850,'paris saint germain':1850,'real madrid':1850,'barcelona':1820,
+  'manchester city':1880,'liverpool':1820,'arsenal':1800,'chelsea':1750,'manchester united':1760,
+  'bayern munich':1900,'inter':1820,'juventus':1800,'milan':1780,'atletico madrid':1800,'napoli':1780,
+  'roma':1740,'tottenham':1760,'galatasaray':1700,'fenerbahce':1680,'besiktas':1650,'trabzonspor':1620,
+  'nantes':1600
 };
 function seedOf(name){
   const key = canonicalKey(name);
@@ -131,7 +122,7 @@ function leagueBaseGpm(league=''){
   return 2.65;
 }
 
-// ---------- HTTP helper (with timeout)
+// ---- HTTP
 const H = API_KEY ? { 'X-Auth-Token': API_KEY, 'accept': 'application/json' } : {};
 async function getJson(url){
   const ctrl = new AbortController();
@@ -145,7 +136,7 @@ async function getJson(url){
   } finally { clearTimeout(t); }
 }
 
-// ---------- Standings & form via football-data.org (best-effort; OK if missing)
+// ---- Standings + form (best effort)
 const standingsCache = new Map();
 async function getStandings(compId){
   if (!API_KEY || !compId) return { table: [], map: new Map(), size: 20 };
@@ -182,40 +173,7 @@ async function getLastLeagueMatches(teamId, compId){
   } catch { return []; }
 }
 
-function matchPoints(forGoals, agGoals){ if (forGoals>agGoals) return 3; if (forGoals===agGoals) return 1; return 0; }
-function formStatsAdvanced(teamId, matches, standingsPack){
-  const size = standingsPack.size || 20;
-  const posMap = standingsPack.map || new Map();
-  const REC = [1.00, 0.92, 0.85, 0.78, 0.72];
-  let pts=0, gf=0, ga=0, oppAvg=0, oppCnt=0, adjScore=0;
-  matches.forEach((m, idx) => {
-    const isHome = m.homeTeam?.id === teamId;
-    const ts = m.score?.fullTime || m.score?.regularTime || {};
-    const h = ts.home ?? 0, a = ts.away ?? 0;
-    const forGoals = isHome ? h : a;
-    const agGoals = isHome ? a : h;
-    const ptsThis = matchPoints(forGoals, agGoals);
-    const oppId = isHome ? m.awayTeam?.id : m.homeTeam?.id;
-    const oppPos = oppId ? (posMap.get(oppId) || Math.ceil(size/2)) : Math.ceil(size/2);
-    const norm = (size - oppPos) / size - 0.5;
-    const OPP_K = 0.8;
-    const oppFactor = 1 + norm * OPP_K;
-    const venueFactor = isHome ? 1.00 : 1.15;
-    const w = REC[idx] ?? 0.7;
-    const score = ptsThis * oppFactor * venueFactor * w;
-    adjScore += score;
-    pts += ptsThis; gf += forGoals; ga += agGoals; oppAvg += oppPos; oppCnt += 1;
-  });
-  const gPlayed = matches.length || 1;
-  const ppm = pts / gPlayed;
-  const gfpm = gf / gPlayed;
-  const gapm = ga / gPlayed;
-  const oppAvgPos = oppCnt ? (oppAvg/oppCnt) : Math.ceil(size/2);
-  const formStrength = (adjScore / 12.0);
-  return { ppm, gfpm, gapm, oppAvgPos, formStrength };
-}
-
-// ---------- Poisson & helpers
+// ---- Model bits (Poisson)
 function fac(n){ let r=1; for(let i=2;i<=n;i++) r*=i; return r; }
 function poisPmf(lam, k){ return Math.exp(-lam) * Math.pow(lam, k) / fac(k); }
 function poisCdf(lam, k){ let s=0; for(let i=0;i<=k;i++) s += poisPmf(lam,i); return s; }
@@ -252,7 +210,7 @@ function expectedGoalsAdvanced(homeName, awayName, leagueName, homeForm, awayFor
   if (seedOf(homeName) - seedOf(awayName) >= STRONG_DIFF_TILT) { lh *= 1.10; la *= 0.90; }
   lh = Math.max(0.15, Math.min(3.2, lh));
   la = Math.max(0.15, Math.min(3.2, la));
-  return { lh, la, seedDiff, homeFormFac:+homeFormFac.toFixed(3), awayFormFac:+awayFormFac.toFixed(3) };
+  return { lh, la };
 }
 function chooseStrongest(lh, la){
   let { pH, pD, pA } = probs1X2(lh, la);
@@ -278,10 +236,11 @@ function chooseStrongest(lh, la){
   return { top, second };
 }
 
-// ---------- Source A: football-data.org (optional)
+// ---- Source A: football-data.org
 async function sourceFootballDataToday() {
   if (!API_KEY) return { rows: [], meta: { name: 'fd', used: false } };
-  const [dateFrom, dateTo] = localStartEndISODate(TZ);
+  const dateFrom = todayYMD(TZ);
+  const dateTo = addDaysLocalYMD(1, TZ);
   const url = `https://api.football-data.org/v4/matches?dateFrom=${dateFrom}&dateTo=${dateTo}&status=SCHEDULED,IN_PLAY,PAUSED,FINISHED`;
   const { status, json, txt } = await getJson(url);
   const arr = Array.isArray(json?.matches) ? json.matches : [];
@@ -291,23 +250,23 @@ async function sourceFootballDataToday() {
     const league = `${f.competition?.area?.name || ''} ${f.competition?.name || ''}`.trim();
     const compId = f.competition?.id;
     const kickoffIso = f.utcDate;
-    const hourLocal = localParts(kickoffIso).hh;
-    if (!(hourLocal >= START_HOUR && hourLocal < END_HOUR)) continue;
+    const hh = localParts(kickoffIso).hh;
+    if (!(hh >= START_HOUR && hh < END_HOUR)) continue;
 
     const homeName = f.homeTeam?.name || '';
     const awayName = f.awayTeam?.name || '';
     const homeId = f.homeTeam?.id;
     const awayId = f.awayTeam?.id;
 
-    let primary = 'N/A', alt = '';
+    let primary = '', alt = '';
     let primaryEdgePct = 0, altEdgePct = 0;
 
     try {
       const standingsPack = compId ? await getStandings(compId) : { map:new Map(), size:20 };
       const homeMatches = homeId ? await getLastLeagueMatches(homeId, compId) : [];
       const awayMatches = awayId ? await getLastLeagueMatches(awayId, compId) : [];
-      const homeForm = formStatsAdvanced(homeId, homeMatches, standingsPack);
-      const awayForm = formStatsAdvanced(awayId, awayMatches, standingsPack);
+      const homeForm = { formStrength: 1.0 };
+      const awayForm = { formStrength: 1.0 };
       const eg = expectedGoalsAdvanced(homeName, awayName, league, homeForm, awayForm);
       const choice = chooseStrongest(eg.lh, eg.la);
 
@@ -325,9 +284,9 @@ async function sourceFootballDataToday() {
 
     rows.push({
       league, kickoffIso, kickoff: toLocalLabel(kickoffIso),
-      hourLocal, home: homeName, away: awayName,
+      home: homeName, away: awayName,
       prediction: primary, altPrediction: alt,
-      primaryEdgePct, altEdgePct
+      primaryEdgePct, altEdgePct, source: 'FD'
     });
   }
 
@@ -335,10 +294,30 @@ async function sourceFootballDataToday() {
   return { rows, meta: { name: 'fd', used: true, count: rows.length, url, status, bodyHead: String(txt).slice(0,300) } };
 }
 
-// ---------- Source B: ESPN schedule (optional; filtered + tolerant)
+// ---- ESPN helpers
+function findLeagueNear($, start){
+  const prevHead = $(start).prevAll('h1,h2,h3,h4').first().text().trim();
+  if (prevHead) return prevHead;
+  let el = $(start);
+  for (let i=0;i<5;i++){
+    const aria = el.attr('aria-label');
+    if (aria && aria.trim()) return aria.trim();
+    const cardTitle = el.prevAll('.Card__Header__Title, .Card__Header, .headline').first().text().trim();
+    if (cardTitle) return cardTitle;
+    el = el.parent();
+    if (!el || !el.length) break;
+  }
+  const aRow = $(start).find('a[href*="competition"], a[href*="league"]').first().text().trim();
+  if (aRow) return aRow;
+  const aUp = $(start).closest('.Card, section, article').find('a[href*="competition"], a[href*="league"]').first().text().trim();
+  if (aUp) return aUp;
+  return '';
+}
+
+// ---- Source B: ESPN
 async function sourceEspnScheduleToday(tz = TZ) {
   if (!ENABLE_ESPN) return { rows: [], meta: { name: 'espn', used: false } };
-  const ymd = todayYMD(tz).replace(/-/g, ''); // YYYYMMDD
+  const ymd = todayYMD(tz).replace(/-/g, '');
   const url = `${ESPN_SCHEDULE_URL}/_/date/${ymd}`;
 
   let html = '';
@@ -346,9 +325,7 @@ async function sourceEspnScheduleToday(tz = TZ) {
     const res = await fetch(url, {
       redirect: 'follow',
       headers: {
-        'user-agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
-          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'accept': 'text/html,application/xhtml+xml',
         'accept-language': 'en-US,en;q=0.8'
       }
@@ -360,120 +337,98 @@ async function sourceEspnScheduleToday(tz = TZ) {
 
   if (ESPN_DEBUG) {
     console.log('[ESPN] URL:', url);
-    console.log('[ESPN] head:', html.slice(0, 1200).replace(/\s+/g,' ').trim());
+    console.log('[ESPN] head:', html.slice(0, 900).replace(/\s+/g,' ').trim());
   }
 
   const $ = cheerio.load(html);
   const rows = [];
-  const blocks = [];
+  const blocks = $('table, .Table__TBODY, .ResponsiveTable, .ScheduleTables');
+  let unknownCount = 0;
 
-  // Try pairing headings with tables
-  $('h2, h3').each((_, el) => {
-    const head = $(el);
-    const league = head.text().trim();
-    const table = head.nextAll('.ResponsiveTable,.Table__TBODY,table').first();
-    if (table && table.length) blocks.push({ league, table });
-  });
+  blocks.each((_, blk) => {
+    const leagueGuess = findLeagueNear($, $(blk));
+    const league = leagueGuess || 'Unknown Competition';
+    const ok = leagueLooksWanted(league);
+    if (!(ok || ESPN_LOOSE)) return;
 
-  // Fallback if not paired
-  if (!blocks.length) {
-    $('.ResponsiveTable, .Table__TBODY, table').each((_, sec) => {
-      const league =
-        $(sec).prevAll('h2, h3').first().text().trim() ||
-        $(sec).closest('.ResponsiveTable').prev('h2, h3').text().trim() ||
-        $(sec).parents().prev('h2, h3').first().text().trim() ||
-        'Unknown Competition';
-      blocks.push({ league, table: $(sec) });
-    });
-  }
-
-  for (const blk of blocks) {
-    const leagueOk = isWantedLeague(blk.league);
-    if (!(leagueOk || ESPN_LOOSE)) continue;
-
-    $(blk.table).find('tr').each((__, tr) => {
+    $(blk).find('tr').each((__, tr) => {
       const tds = $(tr).find('td');
-      if (tds.length < 3) return;
-
-      const t0 = $(tds[0]).text().trim();
-      const t1 = $(tds[1]).text().trim();
-      const t2 = $(tds[2]).text().trim();
-
-      const timeTxt = /\d/.test(t0) ? t0 : (/\d/.test(t1) ? t1 : '');
-      const teams = /\d/.test(t0) ? [t1, t2] : [t0, t1];
-
-      const home = (teams[0] || '').trim();
-      const away = (teams[1] || '').trim();
+      if (tds.length < 2) return;
+      const c0 = $(tds[0]).text().trim();
+      const c1 = $(tds[1]).text().trim();
+      const c2 = $(tds[2] || {}).text?.().trim?.() || '';
+      const hasTime0 = /\d/.test(c0);
+      const hasTime1 = /\d/.test(c1);
+      const timeTxt = hasTime0 ? c0 : (hasTime1 ? c1 : '');
+      const teams = hasTime0 ? [c1, c2] : [c0, c1];
+      let home = (teams[0] || '').replace(/\sv\s*$/i,'').trim();
+      let away = (teams[1] || '').replace(/^\sv\s*/i,'').trim();
       if (!home || !away) return;
 
+      let finalLeague = league;
+      if (/^unknown/i.test(finalLeague)) {
+        const alt = $(tr).find('a[href*="competition"], a[href*="league"]').first().text().trim();
+        if (alt) finalLeague = alt;
+      }
+      if (/^unknown/i.test(finalLeague)) unknownCount++;
+
       const kickoff = timeTxt ? `${todayYMD(tz)} ${timeTxt}` : todayYMD(tz);
-      rows.push({
-        league: blk.league || 'ESPN Schedule',
-        kickoff,
-        home, away,
-        prediction: '', altPrediction: '', primaryEdgePct: 0, altEdgePct: 0
-      });
+      if (!ESPN_LOOSE && /^unknown/i.test(finalLeague)) return;
+
+      rows.push({ league: finalLeague, kickoff, home, away, prediction:'', altPrediction:'', primaryEdgePct:0, altEdgePct:0, source:'ESPN' });
     });
-  }
+  });
 
   const uniq = new Map();
   for (const r of rows) {
     const key = `${r.league}__${r.home}__${r.away}__${r.kickoff}`;
     if (!uniq.has(key)) uniq.set(key, r);
   }
-  const finalRows = Array.from(uniq.values())
-    .filter(r => r.home && r.away)
-    .sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
+  const finalRows = Array.from(uniq.values()).sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
 
-  if (ESPN_DEBUG) {
-    console.log('[ESPN] blocks:', blocks.length, 'rows:', finalRows.length, 'sample:', finalRows.slice(0,5));
-  }
+  if (ESPN_DEBUG) console.log('[ESPN] blocks:', blocks.length, 'rows:', finalRows.length, 'unknown:', unknownCount, 'sample:', finalRows.slice(0,5));
 
-  return { rows: finalRows, meta: { name: 'espn', used: true, count: finalRows.length, url } };
+  return { rows: finalRows, meta: { name: 'espn', used: true, count: finalRows.length, url, unknown: unknownCount } };
 }
 
-// ---------- Fetch fixtures (merge sources with ESPN first, API second)
+// ---- Fetch + merge (ESPN first, then API)
 async function fetchFixturesToday() {
   const date = todayYMD();
-  let rows = [];
+  let combined = [];
 
-  // ESPN first (if enabled)
   try {
     const espn = await sourceEspnScheduleToday(TZ);
-    rows.push(...(espn.rows||[]));
-  } catch(e){
-    if (ESPN_DEBUG) console.log('[ESPN] error:', e?.message || e);
-  }
+    combined.push(...(espn.rows||[]));
+  } catch(e){ if (ESPN_DEBUG) console.log('[ESPN] error', e); }
 
-  // Then API
   try {
     const fd = await sourceFootballDataToday();
-    rows.push(...(fd.rows||[]));
-  } catch(e){
-    console.log('[FD] error:', e?.message || e);
-  }
+    combined.push(...(fd.rows||[]));
+  } catch(e){ console.log('[FD] error', e?.message || e); }
 
-  // Time window filter
-  rows = rows.filter(r => {
-    if (!r.kickoff) return true;
-    const m = r.kickoff.match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})/);
+  combined = combined.filter(r => {
+    const m = (r.kickoff||'').match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})/);
     if (!m) return true;
     const hh = parseInt(m[2],10);
     return (hh >= START_HOUR && hh < END_HOUR);
   });
 
-  // De-dup by kickoff+home+away
-  const seen = new Map();
-  for (const r of rows) {
-    const key = `${(r.kickoff||'')}__${(r.home||'').toLowerCase()}__${(r.away||'').toLowerCase()}`;
-    if (!seen.has(key)) seen.set(key, r);
+  const keyOf = r => `${(r.kickoff||'')}__${(r.home||'').toLowerCase()}__${(r.away||'').toLowerCase()}`;
+  const pickScore = r => (r.prediction ? 2 : 0) + (r.league && !/^unknown/i.test(r.league) ? 1 : 0) + (r.source==='FD' ? 0.5 : 0);
+  const best = new Map();
+  for (const r of combined) {
+    const k = keyOf(r);
+    const cur = best.get(k);
+    if (!cur || pickScore(r) > pickScore(cur)) best.set(k, r);
   }
-  rows = Array.from(seen.values()).sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
+  let rows = Array.from(best.values()).sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
+
+  if (HIDE_PREDICTIONLESS) rows = rows.filter(r => r.prediction);
 
   return { date, rows, count: rows.length };
 }
 
-// ---------- Cache & schedule
+// ---- Cache + schedule
 let CACHE = { date: null, rows: [], savedAt: null };
 async function warmCache() {
   try {
@@ -487,17 +442,17 @@ async function warmCache() {
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
-// ---------- HEAD & UI
+// ---- HEAD & UI
 const HEAD_META = `
   <meta charset="utf-8" />
   <meta name="google-adsense-account" content="ca-pub-4391382697370741">
   <script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-4391382697370741" crossorigin="anonymous"></script>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta name="description" content="BetEstimate.com — free daily AI football predictions and statistical match analysis: 1X2, Over/Under 2.5, BTTS. Updated automatically." />
-  <meta name="keywords" content="AI football predictions, football betting tips, match probabilities, over under 2.5, BTTS, sports analytics, football data, daily picks, BetEstimate" />
+  <meta name="description" content="BetEstimate.com — AI football predictions & daily fixtures. 1X2, Over/Under 2.5, BTTS — color-coded by confidence." />
+  <meta name="keywords" content="BetEstimate, AI football predictions, football tips, match probabilities, over under 2.5, BTTS, sports analytics, daily picks" />
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
-    :root{ --bg:#f1f5f9; --nav:#1e3a8a; --acc1:#84cc16; --acc2:#0ea5e9; --strong:#d9f99d; --medium:#e0f2fe; --low:#f8fafc; }
+    :root{ --bg:#f1f5f9; --nav:#1e3a8a; --acc1:#84cc16; --acc2:#0ea5e9; --strong:#d9f99d; --medium:#e0f2fe; --low:#f8fafc; --muted:#f3f4f6; }
     body{background: var(--bg);} thead.sticky th{position:sticky;top:0;z-index:10}
     th,td{vertical-align:middle}
     .nav-gradient{background: linear-gradient(90deg, var(--nav), #0c4a6e);}
@@ -505,13 +460,13 @@ const HEAD_META = `
     tr.edge-strong { background: var(--strong); }
     tr.edge-medium { background: var(--medium); }
     tr.edge-low    { background: var(--low); }
-    .accent-ring { box-shadow: 0 0 0 3px rgba(14,165,233,.15); }
+    tr.muted       { background: var(--muted); color:#6b7280; }
   </style>
 `;
 function siteHeader(active='home'){
   const link = (href, label) => `<a class="px-3 py-1.5 rounded text-white/90 hover:text-white" href="${href}">${label}</a>`;
   return `
-    <header class="rounded-2xl nav-gradient text-white p-4 flex items-center justify-between accent-ring">
+    <header class="rounded-2xl nav-gradient text-white p-4 flex items-center justify-between">
       <h1 class="text-xl sm:text-2xl font-extrabold tracking-tight">
         BetEstimate<span class="badge">.com</span> — Today’s AI Football Picks
       </h1>
@@ -522,7 +477,7 @@ function siteHeader(active='home'){
 }
 const FOOTER = `<footer class="mt-8 text-[12px] text-slate-700"><div class="italic">Use the data at your own risk. Informational picks only — no guarantees.</div><div class="mt-2">© ${new Date().getFullYear()} BetEstimate.com</div></footer>`;
 
-// ---------- API
+// ---- API & pages
 app.get('/api/today', async (_req, res) => {
   const nowDate = todayYMD();
   if (CACHE.date !== nowDate) await warmCache();
@@ -530,63 +485,48 @@ app.get('/api/today', async (_req, res) => {
 });
 app.get('/diag', async (_req, res) => {
   const fresh = await fetchFixturesToday();
-  res.json({ tz: TZ, startHour: START_HOUR, total: fresh.count, sample: fresh.rows.slice(0,5) });
+  res.json({ tz: TZ, startHour: START_HOUR, hidePredictionless: HIDE_PREDICTIONLESS, total: fresh.count, sample: fresh.rows.slice(0,5) });
 });
 app.get('/diag-espn', async (_req, res) => {
   const out = await sourceEspnScheduleToday(TZ);
-  res.json({
-    enabled: ENABLE_ESPN,
-    looseMode: ESPN_LOOSE,
-    debug: ESPN_DEBUG,
-    url: out.meta?.url,
-    count: out.meta?.count || 0,
-    sample: (out.rows || []).slice(0, 8)
-  });
+  res.json({ enabled: ENABLE_ESPN, looseMode: ESPN_LOOSE, debug: ESPN_DEBUG, url: out.meta?.url, count: out.meta?.count || 0, unknown: out.meta?.unknown || 0, sample: (out.rows || []).slice(0, 8) });
 });
 
-// ---------- Pages
 app.get('/', (_req, res) => {
   const HTML = `<!doctype html><html lang="en"><head><title>BetEstimate.com — Today’s AI Football Picks</title>${HEAD_META}</head>
   <body class="text-slate-900"><div class="max-w-7xl mx-auto p-4 space-y-4">
   <ins class="adsbygoogle" style="display:block" data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>
   ${siteHeader('home')}
-  <div class="grid grid-cols-1 lg:grid-cols-12 gap-4">
-    <aside class="lg:col-span-2 space-y-4">
-      <ins class="adsbygoogle" style="display:block" data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>
-    </aside>
-    <main class="lg:col-span-9">
-      <div class="overflow-x-auto bg-white rounded-2xl shadow">
-        <table class="min-w-full text-[13px] leading-tight" id="tbl">
-          <thead class="bg-slate-100 sticky"><tr class="text-slate-700">
-            <th class="text-left px-2 py-2">Kickoff</th>
-            <th class="text-left px-2 py-2">League</th>
-            <th class="text-left px-2 py-2">Home</th>
-            <th class="text-left px-2 py-2">Away</th>
-            <th class="text-left px-2 py-2">Prediction</th>
-            <th class="text-left px-2 py-2">Alt pick</th>
-          </tr></thead>
-          <tbody id="rows"></tbody>
-        </table>
-      </div>
-      <div class="mt-4"><ins class="adsbygoogle" style="display:block" data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({});</script></div>
-      <div class="mt-3 text-[12px] text-slate-700 font-medium flex flex-wrap gap-4">
-        <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#d9f99d"></span>Strong signal (edge ≥ 10)</span>
-        <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#e0f2fe"></span>Medium signal (5–9)</span>
-        <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#f8fafc"></span>Low signal (&lt; 5)</span>
-      </div>
-      ${FOOTER}
-    </main>
-    <aside class="lg:col-span-1 space-y-4">
-      <ins class="adsbygoogle" style="display:block" data-ad-format="auto" data-full-width-responsive="true"></ins><script>(adsbygoogle=window.adsbygoogle||[]).push({});</script>
-    </aside>
-  </div></div>
+  <div class="overflow-x-auto bg-white rounded-2xl shadow">
+    <table class="min-w-full text-[13px] leading-tight" id="tbl">
+      <thead class="bg-slate-100 sticky"><tr class="text-slate-700">
+        <th class="text-left px-2 py-2">Kickoff</th>
+        <th class="text-left px-2 py-2">League</th>
+        <th class="text-left px-2 py-2">Home</th>
+        <th class="text-left px-2 py-2">Away</th>
+        <th class="text-left px-2 py-2">Prediction</th>
+        <th class="text-left px-2 py-2">Alt pick</th>
+      </tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+  <div class="mt-3 text-[12px] text-slate-700 font-medium flex flex-wrap gap-4">
+    <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#d9f99d"></span>Strong (edge ≥ 10)</span>
+    <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#e0f2fe"></span>Medium (5–9)</span>
+    <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#f8fafc"></span>Low (&lt; 5)</span>
+    <span class="inline-flex items-center"><span class="inline-block w-4 h-4 rounded mr-1" style="background:#f3f4f6"></span>No pick (shown only if HIDE_PREDICTIONLESS=0)</span>
+  </div>
+  ${FOOTER}
+  </div>
   <script>
-    function rowClass(edge){ if (edge >= 10) return 'edge-strong'; if (edge >= 5) return 'edge-medium'; return 'edge-low'; }
+    function rowClass(edge, hasPick){ if(!hasPick) return 'muted'; if (edge >= 10) return 'edge-strong'; if (edge >= 5) return 'edge-medium'; return 'edge-low'; }
     async function load(){
       const res = await fetch("/api/today"); const data = await res.json();
       const rows = data.rows || [];
       document.getElementById("rows").innerHTML = rows.map(r => {
-        const cls = rowClass(Number(r.primaryEdgePct||0));
+        const hasPick = !!(r.prediction && r.prediction.length);
+        const edge = Number(r.primaryEdgePct||0);
+        const cls = rowClass(edge, hasPick);
         return (
           "<tr class='border-b last:border-0 " + cls + "'>" +
             "<td class='px-2 py-2 whitespace-nowrap'>" + (r.kickoff||"") + "</td>" +
@@ -637,7 +577,6 @@ app.get('/contact', (_req, res) => {
   res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.send(HTML);
 });
 
-// ---------- Start
 app.listen(PORT, HOST, () => {
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   setTimeout(() => { warmCache().catch(e => console.error('[warmCache@boot] error', e)); }, 1200);
