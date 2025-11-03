@@ -1,4 +1,9 @@
-// server.js — BetEstimate.com v5.4.0 (ESPN optional + primary/secondary/intl filters)
+// server.js — BetEstimate.com v5.5.0 (ESPN+API merge with fallback, debug toggles)
+// Uses ESPN schedule (if enabled) + football-data.org API (if key present).
+// Picks are AI-estimated via Poisson + form + seed strengths.
+// Color-coded rows by edge. Includes /diag and /diag-espn diagnostics.
+// Render: build=npm install, start=npm start, Node 20.x
+
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -11,40 +16,23 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = '0.0.0.0';
 const TZ = process.env.TZ || 'Europe/Istanbul';
 
-// --- Sources toggles / keys
+// --- Sources / toggles
 const API_KEY = process.env.FOOTBALL_DATA_KEY || ''; // football-data.org (optional)
 const ENABLE_ESPN = process.env.ENABLE_ESPN === '1';
-const ESPN_SCHEDULE_URL = process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule';
+const ESPN_SCHEDULE_URL = (process.env.ESPN_SCHEDULE_URL || 'https://www.espn.com/soccer/schedule').replace(/\/+$/,''); // no trailing slash
 
-// --- Filters & window
-const START_HOUR = parseInt(process.env.START_HOUR || '0', 10);
+// --- ESPN parser debug/loose
+const ESPN_DEBUG = process.env.ESPN_DEBUG === '1'; // log URL & sample, first bytes
+const ESPN_LOOSE = process.env.ESPN_LOOSE === '1'; // skip league filter if DOM is different
+
+// --- Filters & time window
+const START_HOUR = parseInt(process.env.START_HOUR || '0', 10); // local hour inclusive
 const END_HOUR = 24;
 
-// --- Display & AdSense (unchanged)
+// --- Model tuning
 const SHARPEN_TAU_1X2 = parseFloat(process.env.SHARPEN_TAU_1X2 || '1.25');
 const STRONG_DIFF_TILT = parseFloat(process.env.STRONG_DIFF_TILT || '220');
 const EDGE_MIN = parseFloat(process.env.EDGE_MIN || '0.08'); // 8%
-
-// Build regexes from env lists for ESPN filtering
-function buildRegex(listStr) {
-  const s = (listStr || '').trim();
-  if (!s) return null;
-  const parts = s.split('|').map(x => x.trim()).filter(Boolean);
-  if (!parts.length) return null;
-  return new RegExp(`\\b(${parts.join('|')})\\b`, 'i');
-}
-const RX_PRIMARY   = buildRegex(process.env.ESPN_PRIMARY);
-const RX_SECONDARY = buildRegex(process.env.ESPN_SECONDARY);
-const RX_INTL      = buildRegex(process.env.ESPN_INTL);
-function isWantedLeague(leagueLabel = '') {
-  const name = (leagueLabel || '').toLowerCase();
-  if (!name) return false;
-  if (RX_PRIMARY && RX_PRIMARY.test(name)) return true;
-  if (RX_SECONDARY && RX_SECONDARY.test(name)) return true;
-  if (RX_INTL && RX_INTL.test(name)) return true;
-  const defaults = /(premier|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|super lig|mls|scottish premiership|champions league|europa league|conference league|world cup|qualifier)/i;
-  return defaults.test(name);
-}
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -79,6 +67,27 @@ function toLocalLabel(iso, tz = TZ) {
   const { y, m, d, hh, mm } = localParts(iso, tz);
   const pad = n => String(n).padStart(2, '0');
   return `${y}-${pad(m)}-${pad(d)} ${pad(hh)}:${pad(mm)}`;
+}
+
+// ---------- League filters for ESPN
+function buildRegex(listStr) {
+  const s = (listStr || '').trim();
+  if (!s) return null;
+  const parts = s.split('|').map(x => x.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  return new RegExp(`\\b(${parts.join('|')})\\b`, 'i');
+}
+const RX_PRIMARY   = buildRegex(process.env.ESPN_PRIMARY);
+const RX_SECONDARY = buildRegex(process.env.ESPN_SECONDARY);
+const RX_INTL      = buildRegex(process.env.ESPN_INTL);
+function isWantedLeague(leagueLabel = '') {
+  const name = (leagueLabel || '').toLowerCase();
+  if (!name) return false;
+  if (RX_PRIMARY && RX_PRIMARY.test(name)) return true;
+  if (RX_SECONDARY && RX_SECONDARY.test(name)) return true;
+  if (RX_INTL && RX_INTL.test(name)) return true;
+  const defaults = /(premier|la liga|serie a|bundesliga|ligue 1|eredivisie|primeira|super lig|mls|scottish premiership|champions league|europa league|conference league|world cup|qualifier)/i;
+  return defaults.test(name);
 }
 
 // ---------- Aliases & seed strengths
@@ -326,7 +335,7 @@ async function sourceFootballDataToday() {
   return { rows, meta: { name: 'fd', used: true, count: rows.length, url, status, bodyHead: String(txt).slice(0,300) } };
 }
 
-// ---------- Source B: ESPN schedule (optional; filtered)
+// ---------- Source B: ESPN schedule (optional; filtered + tolerant)
 async function sourceEspnScheduleToday(tz = TZ) {
   if (!ENABLE_ESPN) return { rows: [], meta: { name: 'espn', used: false } };
   const ymd = todayYMD(tz).replace(/-/g, ''); // YYYYMMDD
@@ -335,67 +344,116 @@ async function sourceEspnScheduleToday(tz = TZ) {
   let html = '';
   try {
     const res = await fetch(url, {
+      redirect: 'follow',
       headers: {
-        'user-agent': 'Mozilla/5.0 (compatible; BetEstimateBot/1.0; +https://www.betestimate.com)',
-        'accept-language': 'en-US,en;q=0.9',
-      },
+        'user-agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'accept': 'text/html,application/xhtml+xml',
+        'accept-language': 'en-US,en;q=0.8'
+      }
     });
     html = await res.text();
   } catch {
-    return { rows: [], meta: { name: 'espn', used: true, error: 'fetch_failed' } };
+    return { rows: [], meta: { name: 'espn', used: true, error: 'fetch_failed', url } };
+  }
+
+  if (ESPN_DEBUG) {
+    console.log('[ESPN] URL:', url);
+    console.log('[ESPN] head:', html.slice(0, 1200).replace(/\s+/g,' ').trim());
   }
 
   const $ = cheerio.load(html);
   const rows = [];
+  const blocks = [];
 
-  $('.ResponsiveTable, .Table__TBODY, .Table').each((_, sec) => {
-    const section = $(sec);
-    const league =
-      section.prevAll('h2, h3').first().text().trim() ||
-      section.closest('.ResponsiveTable').prev('h2, h3').text().trim() ||
-      section.parents().prev('h2, h3').first().text().trim() ||
-      '';
+  // Try pairing headings with tables
+  $('h2, h3').each((_, el) => {
+    const head = $(el);
+    const league = head.text().trim();
+    const table = head.nextAll('.ResponsiveTable,.Table__TBODY,table').first();
+    if (table && table.length) blocks.push({ league, table });
+  });
 
-    if (!isWantedLeague(league)) return;
+  // Fallback if not paired
+  if (!blocks.length) {
+    $('.ResponsiveTable, .Table__TBODY, table').each((_, sec) => {
+      const league =
+        $(sec).prevAll('h2, h3').first().text().trim() ||
+        $(sec).closest('.ResponsiveTable').prev('h2, h3').text().trim() ||
+        $(sec).parents().prev('h2, h3').first().text().trim() ||
+        'Unknown Competition';
+      blocks.push({ league, table: $(sec) });
+    });
+  }
 
-    section.find('tr').each((__, tr) => {
+  for (const blk of blocks) {
+    const leagueOk = isWantedLeague(blk.league);
+    if (!(leagueOk || ESPN_LOOSE)) continue;
+
+    $(blk.table).find('tr').each((__, tr) => {
       const tds = $(tr).find('td');
       if (tds.length < 3) return;
-      const timeTxt = $(tds[0]).text().trim();
-      const homeTxt = $(tds[1]).text().trim();
-      const awayTxt = $(tds[2]).text().trim();
-      if (!homeTxt || !awayTxt) return;
 
-      const kickoff = /\d/.test(timeTxt) ? `${todayYMD(tz)} ${timeTxt}` : todayYMD(tz);
+      const t0 = $(tds[0]).text().trim();
+      const t1 = $(tds[1]).text().trim();
+      const t2 = $(tds[2]).text().trim();
 
+      const timeTxt = /\d/.test(t0) ? t0 : (/\d/.test(t1) ? t1 : '');
+      const teams = /\d/.test(t0) ? [t1, t2] : [t0, t1];
+
+      const home = (teams[0] || '').trim();
+      const away = (teams[1] || '').trim();
+      if (!home || !away) return;
+
+      const kickoff = timeTxt ? `${todayYMD(tz)} ${timeTxt}` : todayYMD(tz);
       rows.push({
-        league: league || 'ESPN Schedule',
+        league: blk.league || 'ESPN Schedule',
         kickoff,
-        home: homeTxt,
-        away: awayTxt,
+        home, away,
         prediction: '', altPrediction: '', primaryEdgePct: 0, altEdgePct: 0
       });
     });
-  });
+  }
 
   const uniq = new Map();
   for (const r of rows) {
     const key = `${r.league}__${r.home}__${r.away}__${r.kickoff}`;
     if (!uniq.has(key)) uniq.set(key, r);
   }
+  const finalRows = Array.from(uniq.values())
+    .filter(r => r.home && r.away)
+    .sort((a,b)=> (a.kickoff||'').localeCompare(b.kickoff||''));
 
-  const finalRows = Array.from(uniq.values());
+  if (ESPN_DEBUG) {
+    console.log('[ESPN] blocks:', blocks.length, 'rows:', finalRows.length, 'sample:', finalRows.slice(0,5));
+  }
+
   return { rows: finalRows, meta: { name: 'espn', used: true, count: finalRows.length, url } };
 }
 
-// ---------- Fetch fixtures (merge sources)
+// ---------- Fetch fixtures (merge sources with ESPN first, API second)
 async function fetchFixturesToday() {
   const date = todayYMD();
   let rows = [];
 
-  try { const fd = await sourceFootballDataToday(); rows.push(...(fd.rows||[])); } catch(e){}
-  try { const espn = await sourceEspnScheduleToday(TZ); rows.push(...(espn.rows||[])); } catch(e){}
+  // ESPN first (if enabled)
+  try {
+    const espn = await sourceEspnScheduleToday(TZ);
+    rows.push(...(espn.rows||[]));
+  } catch(e){
+    if (ESPN_DEBUG) console.log('[ESPN] error:', e?.message || e);
+  }
 
+  // Then API
+  try {
+    const fd = await sourceFootballDataToday();
+    rows.push(...(fd.rows||[]));
+  } catch(e){
+    console.log('[FD] error:', e?.message || e);
+  }
+
+  // Time window filter
   rows = rows.filter(r => {
     if (!r.kickoff) return true;
     const m = r.kickoff.match(/(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})/);
@@ -404,6 +462,7 @@ async function fetchFixturesToday() {
     return (hh >= START_HOUR && hh < END_HOUR);
   });
 
+  // De-dup by kickoff+home+away
   const seen = new Map();
   for (const r of rows) {
     const key = `${(r.kickoff||'')}__${(r.home||'').toLowerCase()}__${(r.away||'').toLowerCase()}`;
@@ -471,7 +530,18 @@ app.get('/api/today', async (_req, res) => {
 });
 app.get('/diag', async (_req, res) => {
   const fresh = await fetchFixturesToday();
-  res.json({ tz: TZ, startHour: START_HOUR, total: fresh.count, sample: fresh.rows.slice(0,3) });
+  res.json({ tz: TZ, startHour: START_HOUR, total: fresh.count, sample: fresh.rows.slice(0,5) });
+});
+app.get('/diag-espn', async (_req, res) => {
+  const out = await sourceEspnScheduleToday(TZ);
+  res.json({
+    enabled: ENABLE_ESPN,
+    looseMode: ESPN_LOOSE,
+    debug: ESPN_DEBUG,
+    url: out.meta?.url,
+    count: out.meta?.count || 0,
+    sample: (out.rows || []).slice(0, 8)
+  });
 });
 
 // ---------- Pages
