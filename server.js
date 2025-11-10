@@ -1,4 +1,4 @@
-// server.js — BetEstimate v5.5.4 (Fixed ESPN league detection)
+// server.js — BetEstimate v5.5.4 (ESPN parser with debug endpoint)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -175,7 +175,7 @@ function looksOddsNoise(s){
          /odds:/i.test(s) ||
          /money line/i.test(s) ||
          /^pick:/i.test(s) ||
-         s.length < 5; // Very short text is likely noise
+         (s.length < 3 && !/[A-Z]{2,}/.test(s)); // Only filter very short non-team text
 }
 
 // More flexible league filtering - include more competitions
@@ -234,7 +234,19 @@ function isWantedLeague(leagueName) {
   return ESPN_LOOSE;
 }
 
-// Improved team name cleaning for ESPN - more flexible
+// Helper function to clean individual team names
+function cleanTeamName(team) {
+  if (!team) return '';
+  
+  return team
+    .replace(/\s*\(\w+\)$/, '') // Remove country codes (A) etc.
+    .replace(/^(FC|AFC|CF|CD|SD|UD)\s+/i, '') // Remove common prefixes
+    .replace(/\s+(FC|CF|CD|SD|UD)$/i, '') // Remove common suffixes
+    .replace(/\s*\d+:\d+\s*$/, '') // Remove trailing scores
+    .trim();
+}
+
+// Improved team name cleaning for ESPN - handles various formats
 function cleanTeams(text) {
   if (!text) return { home: '', away: '' };
   
@@ -243,6 +255,8 @@ function cleanTeams(text) {
   // Remove common betting lines and noise
   if (looksOddsNoise(t)) return { home: '', away: '' };
   
+  console.log('[ESPN] Parsing match text:', t); // Debug log
+
   // Try multiple separator patterns in order of preference
   const separators = [
     /\s+vs\.?\s+/i,        // " vs " or " vs. " (most common)
@@ -258,44 +272,50 @@ function cleanTeams(text) {
       let home = parts[0].trim();
       let away = parts[1].trim();
       
-      // Clean up team names - remove common suffixes/prefixes
-      home = home.replace(/\s*\(\w+\)$/, '').trim(); // Remove (A) etc.
-      away = away.replace(/\s*\(\w+\)$/, '').trim();
+      // Clean up team names
+      home = cleanTeamName(home);
+      away = cleanTeamName(away);
       
-      // Remove FC/AFC prefixes if they cause issues
-      home = home.replace(/^(FC|AFC)\s+/i, '').trim();
-      away = away.replace(/^(FC|AFC)\s+/i, '').trim();
-      
-      // Basic validation - both teams should have reasonable length
-      if (home.length >= 2 && away.length >= 2) {
+      // Basic validation
+      if (home.length >= 2 && away.length >= 2 && home !== away) {
+        console.log('[ESPN] Successfully parsed with separator:', { home, away, separator: separator.toString() });
         return { home, away };
       }
     }
   }
 
-  // Fallback: try to split by any non-word boundary if above fails
-  const fallbackMatch = t.match(/(.+?)\s+(?:vs|v|@|-|–|—|at)\s+(.+)/i);
-  if (fallbackMatch) {
-    let home = fallbackMatch[1].trim();
-    let away = fallbackMatch[2].trim();
-    
-    if (home.length >= 2 && away.length >= 2) {
-      return { home, away };
+  // Fallback: try common patterns without explicit separators
+  const patterns = [
+    // Pattern for "TeamA TeamB" format (common in ESPN)
+    /^([A-Za-z][A-Za-z\s]+?)\s+([A-Z][A-Za-z\s]+)$/,
+    // Pattern for teams with FC/United/City etc.
+    /^([A-Za-z\s]+?(?:FC|United|City|Town|FC))\s+([A-Za-z\s]+?(?:FC|United|City|Town|FC))$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = t.match(pattern);
+    if (match) {
+      let home = cleanTeamName(match[1]);
+      let away = cleanTeamName(match[2]);
+      
+      if (home.length >= 2 && away.length >= 2 && home !== away) {
+        console.log('[ESPN] Successfully parsed with pattern:', { home, away, pattern: pattern.toString() });
+        return { home, away };
+      }
     }
   }
 
-  // Last resort: if it looks like "TeamA TeamB" without separator, try to guess
-  const words = t.split(/\s+/);
-  if (words.length >= 4) {
-    // Try splitting in the middle
-    const mid = Math.floor(words.length / 2);
-    const home = words.slice(0, mid).join(' ');
-    const away = words.slice(mid).join(' ');
-    
-    if (home.length >= 2 && away.length >= 2) {
-      console.log('[ESPN] Fallback parsing:', { original: t, home, away });
-      return { home, away };
-    }
+  // Last resort: manual mapping for known problematic teams
+  const manualMap = {
+    'AFC Toronto': { home: 'Toronto', away: '' }, // This might be a single team listing
+    'Burgos': { home: 'Burgos', away: '' }, // Same issue
+    'Cheltenham Town': { home: 'Cheltenham Town', away: '' },
+    // Add more as needed
+  };
+
+  if (manualMap[t]) {
+    console.log('[ESPN] Using manual mapping for:', t);
+    return manualMap[t];
   }
 
   console.log('[ESPN] Failed to parse teams:', t);
@@ -485,6 +505,55 @@ async function warmCache(){
 }
 cron.schedule('1 0 * * *', async () => { await warmCache(); }, { timezone: TZ });
 
+// ---- Debug endpoint to see raw ESPN data
+app.get('/debug-espn-raw', async (_req, res)=>{
+  const ymd = todayYMD(TZ).replace(/-/g,'');
+  const url = `${ESPN_SCHEDULE_URL}/_/date/${ymd}`;
+  
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    const html = await response.text();
+    const $ = cheerio.load(html);
+    
+    // Extract sample table data for debugging
+    const tables = $('table');
+    const tableData = [];
+    
+    tables.each((i, table) => {
+      const $table = $(table);
+      const league = nearestLeague($, table);
+      const rows = [];
+      
+      $table.find('tbody tr').each((j, row) => {
+        const cells = [];
+        $(row).find('td').each((k, cell) => {
+          cells.push($(cell).text().trim());
+        });
+        rows.push(cells);
+      });
+      
+      tableData.push({
+        tableIndex: i,
+        league,
+        header: $table.find('thead th').map((i, th) => $(th).text().trim()).get(),
+        sampleRows: rows.slice(0, 3) // First 3 rows
+      });
+    });
+    
+    res.json({
+      url,
+      tablesFound: tables.length,
+      tableData
+    });
+  } catch (error) {
+    res.json({ error: error.message });
+  }
+});
+
 // ---- UI
 const HEAD = `
   <meta charset="utf-8" />
@@ -607,5 +676,6 @@ app.get('/contact', (_req, res)=> res.send('<!doctype html><head>'+HEAD+'</head>
 app.listen(PORT, HOST, ()=>{
   console.log(`✅ Server listening on ${HOST}:${PORT}`);
   console.log(`📅 Using ESPN as data source: ${ESPN_SCHEDULE_URL}`);
+  console.log(`🐛 Debug endpoint available at: /debug-espn-raw`);
   setTimeout(()=>{ warmCache().catch(e=>console.error('[warmCache] error', e)); }, 1200);
 });
