@@ -1,4 +1,4 @@
-// server.js — BetEstimate v5.5.4 (ESPN parser with league filtering)
+// server.js — BetEstimate v5.5.4 (Fixed ESPN league detection)
 import express from 'express';
 import dotenv from 'dotenv';
 import cron from 'node-cron';
@@ -122,20 +122,52 @@ function headerMap($, $table){
   });
   return idx;
 }
+
+// Improved league detection for ESPN
 function nearestLeague($, node){
-  // previous heading text
-  const prevHead = $(node).prevAll('h1,h2,h3,h4').first().text().trim();
-  if (prevHead) return prevHead;
-  // ancestor aria-label or card header
   let el = $(node);
-  for (let i=0;i<5;i++){
-    const aria = el.attr('aria-label'); if (aria) return aria.trim();
-    const cardTitle = el.prevAll('.Card__Header__Title, .Card__Header, .headline').first().text().trim();
-    if (cardTitle) return cardTitle;
-    el = el.parent(); if (!el || !el.length) break;
+  
+  // Look for league name in various possible locations
+  for (let i=0; i<6; i++){
+    // Check previous siblings for header elements
+    const prevHeader = el.prevAll('h1, h2, h3, h4, h5, .Table__Title, .card-header, .header').first();
+    if (prevHeader.length) {
+      const text = prevHeader.text().trim();
+      if (text && !text.includes('Date') && !text.includes('Schedule')) {
+        return text;
+      }
+    }
+    
+    // Check parent elements for data attributes or classes that might contain league info
+    const parent = el.parent();
+    const parentClass = parent.attr('class') || '';
+    const parentId = parent.attr('id') || '';
+    
+    if (parentClass.includes('league') || parentId.includes('league')) {
+      const text = parent.text().trim();
+      if (text) return text.split('\n')[0].trim();
+    }
+    
+    // Check for aria-label or data attributes
+    const ariaLabel = el.attr('aria-label') || parent.attr('aria-label');
+    if (ariaLabel && !ariaLabel.includes('Date')) {
+      return ariaLabel;
+    }
+    
+    el = parent;
+    if (!el.length) break;
   }
-  return '';
+  
+  // Fallback: try to find any text above the table that looks like a league name
+  const tableContainer = $(node).closest('div, section');
+  const aboveText = tableContainer.prevAll('h1, h2, h3, h4, h5, div').first().text().trim();
+  if (aboveText && aboveText.length < 100 && !aboveText.includes('Date')) {
+    return aboveText;
+  }
+  
+  return 'Unknown Competition';
 }
+
 function looksOddsNoise(s){ 
   return /^line:/i.test(s) || 
          /^o\/u/i.test(s) || 
@@ -146,28 +178,42 @@ function looksOddsNoise(s){
          s.length < 5; // Very short text is likely noise
 }
 
-// League filtering - only include major competitions
+// More flexible league filtering - include more competitions
 function isWantedLeague(leagueName) {
-  if (!leagueName) return false;
+  if (!leagueName || leagueName === 'Unknown Competition') {
+    return ESPN_LOOSE; // Allow unknown competitions if ESPN_LOOSE is enabled
+  }
   
   const league = leagueName.toLowerCase();
   
-  // Major leagues to INCLUDE
+  // Major leagues to INCLUDE (expanded list)
   const wantedPatterns = [
+    // Top European leagues
     'premier league', 'la liga', 'serie a', 'bundesliga', 'ligue 1',
+    // European competitions
     'champions league', 'europa league', 'conference league',
-    'super lig', 'süper lig', 'eredivisie', 'primeira liga',
-    'mls', 'major league soccer', 'brasileirão', 'serie b',
-    'championship', 'league one', 'league two', 'scottish premiership',
-    'belgian pro league', 'austrian bundesliga', 'swiss super league',
-    'russian premier league', 'ukrainian premier league',
-    'copa libertadores', 'copa sudamericana', 'fa cup', 'efl cup'
+    // Other major leagues
+    'super lig', 'süper lig', 'eredivisie', 'primeira liga', 'premiership',
+    // English lower divisions
+    'championship', 'league one', 'league two', 'efl', 
+    // Spanish lower divisions
+    'la liga 2', 'segunda division',
+    // Other European leagues
+    'belgian', 'austrian', 'swiss', 'russian', 'ukrainian', 'scottish',
+    // South American
+    'copa libertadores', 'copa sudamericana', 'brasileirão', 'serie b', 'argentina',
+    // African leagues
+    'premier league', 'kenya', 'nigeria', 'south africa', 'egypt',
+    // Cups
+    'fa cup', 'efl cup', 'copa del rey', 'dfb pokal', 'coppa italia',
+    // MLS and others
+    'mls', 'major league soccer'
   ];
   
   // Patterns to EXCLUDE (youth, women, friendlies)
   const excludePatterns = [
     'u17', 'u18', 'u19', 'u20', 'u21', 'u23', 'women', 'friendly',
-    'youth', 'academy', 'reserve', 'development', 'women\'s'
+    'youth', 'academy', 'reserve', 'development', 'women\'s', 'girls'
   ];
   
   // Check if league matches any exclusion patterns
@@ -184,7 +230,8 @@ function isWantedLeague(leagueName) {
     }
   }
   
-  return false;
+  // If ESPN_LOOSE is enabled, include unknown leagues
+  return ESPN_LOOSE;
 }
 
 // Improved team name cleaning for ESPN - more flexible
@@ -321,8 +368,7 @@ async function sourceEspnScheduleToday(tz = TZ){
       return;
     }
 
-    const wanted = /unknown/i.test(league) ? ESPN_LOOSE : true;
-    if (!wanted) return;
+    if (ESPN_DEBUG) console.log('[ESPN] Processing league:', league);
 
     $tbl.find('tbody tr').each((__, tr)=>{
       const tds = $(tr).find('td');
